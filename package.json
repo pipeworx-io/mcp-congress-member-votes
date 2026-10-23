@@ -1,0 +1,32 @@
+{
+  "name": "@pipeworx/mcp-congress-member-votes",
+  "version": "0.1.0",
+  "description": "Congress Member Votes -- how each U.S. House member voted, from the U.S. House Clerk's roll-call votes, with attendance and party-line share.",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "bin": {
+    "mcp-congress-member-votes": "bin/cli.js"
+  },
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "congress-member-votes"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pipeworx-io/mcp-congress-member-votes.git"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "@cloudflare/workers-types": "^4.20260405.1"
+  },
+  "pipeworx": {
+    "sourceHash": "v1-bde432e1f8b7157721d218d1e08807f3c5e5b0c4b5edb6415eb3404c0292567f",
+    "sourceCommit": "70a4e816a9195016cd4af92dca2019485d4c3865"
+  }
+}
