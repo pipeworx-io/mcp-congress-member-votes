@@ -934,6 +934,344 @@ async function parseJsonBounded<T>(
     );
   }
 }
+
+
+/**
+ * Pure parser for Senate roll-call votes as printed in the Congressional
+ * Record (U.S. Government Publishing Office, Congressional Record). The Record
+ * prints each roll call as a block:
+ *
+ *   The yeas and nays resulted--yeas 71, nays 29, as follows:
+ *                          [Rollcall Vote No. 49 Ex.]
+ *                                YEAS--71
+ *      Baldwin
+ *      ...
+ *                                NAYS--29
+ *      ...
+ *                             NOT VOTING--0
+ *
+ * Names are surnames (with a state suffix only where two senators of the same
+ * Congress share one), NOT member ids -- the caller resolves them against a
+ * roster. This module never guesses: a block whose name lists do not equal
+ * the counts the Record itself declares (in two places) is returned in
+ * `rejected` with the reason, never as a vote with a plausible-looking list.
+ * No I/O.
+ */
+
+type SenatePos = 'Y' | 'N' | 'P' | 'X';
+
+interface SenateName {
+  /** surname as printed, e.g. "Cortez Masto" */
+  last: string;
+  /** two-letter state when the Record disambiguates ("Scott (FL)"), else '' */
+  st: string;
+  pos: SenatePos;
+}
+
+interface SenateCrecVote {
+  n: number;
+  /** "Leg." / "Ex." / "" -- the Senate's own legislative / executive-session tag */
+  tag: string;
+  /** tally the Record announces just above the list */
+  yeas: number;
+  nays: number;
+  /** names listed under each heading */
+  names: SenateName[];
+  /** the question being put, as the Record words it ('' when not found) */
+  question: string;
+  /** the Record's own heading for the vote ("Vote on H.R. 1, As Amended"), '' when it printed none */
+  heading: string;
+  /** the Record's own sentence announcing the outcome ('' when not found) */
+  outcome: string;
+  /** legislation or nomination numbers named near the vote, e.g. "H.R. 1", "PN12" */
+  refs: string[];
+  /** true when the Vice President cast a tie-breaking vote (not in the names) */
+  vp_tiebreak: boolean;
+  /** positions whose list heading printed no count ("NOT VOTING--"); their length could not be cross-checked against the Record */
+  uncounted: SenatePos[];
+}
+
+interface SenateCrecParse {
+  votes: SenateCrecVote[];
+  /** blocks found but not trusted: [vote number or null, reason] */
+  rejected: [number | null, string][];
+}
+
+function decode(s: string): string {
+  return s
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)));
+}
+
+/**
+ * The Record's HTML is a <pre> block; strip tags, keep line structure. Only real
+ * tags go: the text itself can carry a bare "<" ("<50K") that a naive
+ * <[^>]*> would take as a tag opener and swallow thousands of characters with.
+ */
+function crecText(html: string): string {
+  return decode(html.replace(/<\/?[A-Za-z][^<>]*>/g, '')).replace(/={5,}\s*NOTE\s*={5,}[\s\S]*?={5,}\s*END NOTE\s*={5,}/g, '\n');
+}
+
+const HEAD_RE = /^\s*(YEAS|NAYS|NOT VOTING|PRESENT|ANSWERED\s*[`'"]*\s*PRESENT\s*[`'"]*)\s*[-—–]+\s*(\d*)\s*$/i;
+/** Every word capitalised: the only names accepted under a heading that printed no count (prose such as "The nomination was confirmed" fails). */
+const STRICT_NAME_RE = /^[A-Z][A-Za-z'\u2019-]*(\s+[A-Z][A-Za-z'\u2019-]*)*(\s*\([A-Z]{2}\))?$/;
+const NAME_RE = /^[A-Z][A-Za-zÀ-ſ'’.\- ]*(\s*\([A-Z]{2}\))?$/;
+
+const ABBREV = /\b(No|Nos|Mr|Mrs|Ms|Dr|St|Jr|Sr|Sen|Rep|Res|Con|Mt|U\.S|H\.R|[A-Z])\./g;
+/** Sentences of Record prose; abbreviations ("No.", "H.R.", "Mr.") do not end one. */
+function sentences(text: string): string[] {
+  const flat = text.replace(/\[\[Page [^\]]*\]\]|\[Congressional Record Volume[^\]]*\]|\[(?:Senate|House)\]|\[Page [A-Z]\d+\]|From the Congressional Record Online through the Government Publishing Office \[[^\]]*\]/g, ' ').replace(/\s+/g, ' ').trim().replace(ABBREV, '$1\u0001');
+  return flat.split(/(?<=[.?!])\s+(?=[A-Z("])/).map((x) => x.replace(/\u0001/g, '.').trim()).filter(Boolean);
+}
+const OUTCOME_START = /^(The |Three-fifths|Two-thirds|A majority|Upon |Under the previous order|Pursuant to the previous order)/;
+const OUTCOME_WORDS = /\b(?:agreed to|rejected|confirmed|passed|adopted|sustained|invoked|waived|tabled|laid on the table|withdrawn|not sustained|not agreed|not having voted)\b/i;
+const POSITIVE = /\b(?:agreed to|confirmed|passed|adopted|sustained|invoked|waived|tabled|laid on the table|withdrawn)\b/i;
+const NEGATIVE = /\bnot (?:agreed|sustained|invoked|waived|adopted|passed|confirmed)|rejected|not having voted in the affirmative/i;
+
+function posOf(head: string): SenatePos {
+  const h = head.toUpperCase();
+  if (h.startsWith('YEAS')) return 'Y';
+  if (h.startsWith('NAYS')) return 'N';
+  if (h.startsWith('NOT')) return 'X';
+  return 'P';
+}
+
+function splitNames(line: string): string[] {
+  return line
+    .trim()
+    .split(/\s{2,}/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+function toName(raw: string, pos: SenatePos): SenateName | null {
+  const m = /^(.*?)\s*(?:\(([A-Z]{2})\))?$/.exec(raw.trim());
+  if (!m || !m[1] || !NAME_RE.test(raw.trim())) return null;
+  return { last: m[1].trim(), st: m[2] ?? '', pos };
+}
+
+function parseSenateCrec(html: string): SenateCrecParse {
+  const text = crecText(html);
+  const lines = text.split('\n');
+  const out: SenateCrecParse = { votes: [], rejected: [] };
+  const markers: { line: number; n: number; tag: string }[] = [];
+  lines.forEach((ln, i) => {
+    const m = /\[Rollcall vote No\.\s*(\d+)\s*([^\]]*?)\.?\s*\]/i.exec(ln);
+    if (m) markers.push({ line: i, n: Number(m[1]), tag: m[2].replace(/\.$/, '').trim() });
+  });
+  for (let k = 0; k < markers.length; k++) {
+    const { line, n, tag } = markers[k];
+    const prevEnd = k > 0 ? markers[k - 1].line : 0;
+    // the announced tally sits within a few lines above the marker
+    const above = lines.slice(Math.max(prevEnd, line - 12), line).join(' ').replace(/\s+/g, ' ');
+    // the Record words the announcement three ways: "yeas 71, nays 29", "resulted 54, nays 46" (sic), "60 yeas, 36 nays"
+    const tl = [...above.matchAll(/(?:yeas|resulted)\s+(\d+),\s*nays\s+(\d+)/gi)].pop();
+    const tl2 = [...above.matchAll(/(\d+)\s+yeas,\s*(\d+)\s+nays/gi)].pop();
+    const pick = tl && tl2 ? ((tl.index ?? 0) > (tl2.index ?? 0) ? tl : tl2) : (tl ?? tl2);
+    if (!pick) { out.rejected.push([n, 'no announced tally above the roll-call marker']); continue; }
+    const yeas = Number(pick[1]);
+    const nays = Number(pick[2]);
+
+    // lists
+    const names: SenateName[] = [];
+    const declared: Record<SenatePos, number | undefined> = { Y: undefined, N: undefined, P: undefined, X: undefined };
+    let cur: SenatePos | null = null;
+    let got = 0;
+    let end = line + 1;
+    let bad = '';
+    for (let i = line + 1; i < lines.length && i < line + 400; i++) {
+      const ln = lines[i];
+      end = i;
+      if (/\[Rollcall vote No\./i.test(ln) && i !== line) break;
+      const h = HEAD_RE.exec(ln);
+      if (h) { cur = posOf(h[1]); declared[cur] = h[2] === '' ? -1 : Number(h[2]); got = 0; continue; }
+      if (!ln.trim() || /^\s*\[\[Page\s/.test(ln) || /^\s*<all>\s*$/.test(ln)) continue;
+      if (/^\s*(None|Nobody)\.?\s*$/i.test(ln)) continue;
+      if (cur === null) { bad = 'text between the marker and the YEAS list'; break; }
+      // a section that already holds its declared count ends the lists: whatever follows is prose, not names
+      const unknownCount = declared[cur] === -1;
+      if (!unknownCount && got >= (declared[cur] ?? 0)) break;
+      const parts = splitNames(ln);
+      if (unknownCount && !parts.every((p) => STRICT_NAME_RE.test(p))) break;
+      const ns = parts.map((p) => toName(p, cur as SenatePos));
+      if (ns.some((x) => x === null)) {
+        // first prose line ends the lists
+        break;
+      }
+      for (const x of ns) names.push(x as SenateName);
+      got += ns.length;
+    }
+    if (bad) { out.rejected.push([n, bad]); continue; }
+    // the Record omits the heading of a side with nobody on it; accept that only when the announced tally says zero
+    if (declared.Y === -1 || declared.N === -1) { out.rejected.push([n, 'the YEAS or NAYS heading printed no count']); continue; }
+    if (declared.Y === undefined && yeas === 0) declared.Y = 0;
+    if (declared.N === undefined && nays === 0) declared.N = 0;
+    if (declared.Y === undefined || declared.N === undefined) { out.rejected.push([n, 'YEAS/NAYS headings not found']); continue; }
+    if (declared.Y !== yeas || declared.N !== nays) {
+      out.rejected.push([n, `announced tally ${yeas}-${nays} disagrees with list headings ${declared.Y}-${declared.N}`]);
+      continue;
+    }
+    let mismatch = '';
+    for (const p of ['Y', 'N', 'P', 'X'] as SenatePos[]) {
+      const d = declared[p];
+      const c = names.filter((x) => x.pos === p).length;
+      if (d === undefined) { if (c > 0) mismatch = `names listed under an undeclared heading (${p})`; }
+      else if (d === -1) { if (c === 0) mismatch = `heading for ${p} printed no count and no names followed`; }
+      else if (d !== c) mismatch = `heading says ${d} but ${c} names parsed (${p})`;
+    }
+    if (mismatch) { out.rejected.push([n, mismatch]); continue; }
+
+    // context: the question above, the outcome sentence directly below
+    const nextStart = k + 1 < markers.length ? markers[k + 1].line : lines.length;
+    const ctxAbove = lines.slice(Math.max(prevEnd, line - 60), line).join('\n');
+    const headings = lines.slice(Math.max(prevEnd, line - 60), line).filter((l) => /^\s{8,}Vote on\s+\S/i.test(l));
+    const heading = headings.length ? headings[headings.length - 1].trim().slice(0, 160) : '';
+    const qs = sentences(ctxAbove).filter((x) => /\bthe question\b/i.test(x) && !/^(?:Mr|Mrs|Ms)\./.test(x));
+    const question = qs.length ? qs[qs.length - 1].slice(0, 400) : '';
+    const belowLines = lines.slice(end, Math.min(nextStart, end + 40)).join('\n');
+    const vp = /VICE PRESIDENT[^.]{0,200}(?:yeas|nays)[^.]*equally divided|Senate being equally divided[^.]*Vice President votes/i.test(belowLines.replace(/\s+/g, ' ')) || /equally divided,? the Vice President/i.test(belowLines.replace(/\s+/g, ' '));
+    // Only the first few sentences after the lists can be this vote's outcome; a later one is some other motion's.
+    const after = sentences(belowLines.replace(/^\s*\[\[Page [^\]]*\]\]\s*$/gm, '')).filter((x) => !/^The (?:PRESIDING OFFICER|VICE PRESIDENT|ACTING PRESIDENT pro tempore)\b[^.]*?\)?\.$/i.test(x)).slice(0, 5);
+    let outcome = '';
+    for (const sent of after) {
+      const t = sent.replace(/^The (?:PRESIDING OFFICER|VICE PRESIDENT|ACTING PRESIDENT pro tempore)\b[^.]*?\)?\.\s*/i, '').trim();
+      if (OUTCOME_START.test(t) && OUTCOME_WORDS.test(t)) {
+        // the sentence only: drop the "____" separator and a printed text that follows "as follows"
+        outcome = t.replace(/\s*_{4,}.*$/, '').replace(/,?\s+as follows\b.*$/i, '').trim().slice(0, 300);
+        break;
+      }
+    }
+    // A positive outcome cannot follow a vote with more nays than yeas (a threshold only raises the bar): such a sentence belongs to something else.
+    if (outcome && POSITIVE.test(outcome) && !NEGATIVE.test(outcome) && yeas < nays && !vp) outcome = '';
+    const refs = [...new Set([...`${heading} ${question}`.matchAll(/\b(?:H\.\s?R\.|S\.|H\.\s?J\.\s?Res\.|S\.\s?J\.\s?Res\.|H\.\s?Con\.\s?Res\.|S\.\s?Con\.\s?Res\.|H\.\s?Res\.|S\.\s?Res\.)\s?\d+|\bPN\d+(?:-\d+)?/g)].map((m) => m[0].replace(/\s+/g, ' ')))].slice(0, 4);
+    out.votes.push({ n, tag, yeas, nays, names, question, heading, outcome, refs, vp_tiebreak: vp, uncounted: (['P', 'X'] as SenatePos[]).filter((p) => declared[p] === -1) });
+  }
+  return out;
+}
+
+
+/**
+ * Live reads of Senate roll calls from the Congressional Record (U.S.
+ * Government Publishing Office). Discovery is a full-text search of the Record
+ * for the roll-call marker (one request per 100 hits, needs the api.data.gov
+ * key the gateway already supplies as `_apiKey`); each hit is then read from
+ * the Record's public page for that section (keyless) and handed to
+ * parseSenateCrec. Used by congress `get_votes` and by the live top-up in
+ * congress-member-votes, so both read the Record the same way.
+ */
+
+const SEARCH_URL = 'https://api.govinfo.gov/search';
+const CONTENT_BASE = 'https://www.govinfo.gov/content/pkg';
+const UA$shared = 'pipeworx-congress/1.0 (+https://pipeworx.io)';
+
+interface SenateRollHit {
+  /** Congressional Record issue date, YYYY-MM-DD */
+  date: string;
+  vote: SenateCrecVote;
+  granule: string;
+}
+interface SenateRollScan {
+  hits: SenateRollHit[];
+  /** vote-number blocks the Record printed but the parser would not vouch for */
+  rejected: { n: number | null; why: string; date: string }[];
+  /** sections the search returned that were read */
+  granules_read: number;
+  /** true when the scan stopped at its read budget with more search hits unread */
+  truncated: boolean;
+  /** set when the search itself failed (the scan is then unusable) */
+  error?: string;
+}
+
+interface SearchResult { packageId?: string | null; granuleId?: string | null; resultLink?: string | null; dateIssued?: string | null }
+
+function granuleOf(r: SearchResult): string | null {
+  if (r.granuleId) return r.granuleId;
+  const m = /\/granules\/([^/]+)\//.exec(r.resultLink ?? '');
+  return m ? m[1] : null;
+}
+
+async function pool<T>(items: T[], n: number, fn: (x: T) => Promise<void>): Promise<void> {
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (i < items.length) await fn(items[i++]); }));
+}
+
+/**
+ * Search the Record for roll-call sections published in [from, to] and read
+ * them. `order` is the publish-date order of the search; `enough` is asked
+ * after each whole page-of-days is read and stops the scan when it returns true
+ * (never mid-day, so a day's votes are never half-read).
+ */
+async function scanSenateRolls(opts: {
+  apiKey: string;
+  from: string;
+  to: string;
+  order: 'ASC' | 'DESC';
+  maxGranules?: number;
+  enough?: (hits: SenateRollHit[]) => boolean;
+}): Promise<SenateRollScan> {
+  const scan: SenateRollScan = { hits: [], rejected: [], granules_read: 0, truncated: false };
+  const budget = opts.maxGranules ?? 60;
+  let mark = '*';
+  const seen = new Set<string>();
+  for (let page = 0; page < 12; page++) {
+    let body: { results?: SearchResult[]; offsetMark?: string | null; count?: number };
+    try {
+      const res = await fetchWithTimeout(`${SEARCH_URL}?api_key=${encodeURIComponent(opts.apiKey)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': UA$shared },
+        body: JSON.stringify({
+          query: `Rollcall AND collection:(CREC) AND publishdate:range(${opts.from},${opts.to})`,
+          pageSize: 100,
+          offsetMark: mark,
+          sorts: [{ field: 'publishdate', sortOrder: opts.order }],
+        }),
+      }, 'GovInfo');
+      if (res.status === 401 || res.status === 403) { scan.error = 'GovInfo refused the key (HTTP ' + res.status + ')'; return scan; }
+      if (!res.ok) { scan.error = `GovInfo search answered HTTP ${res.status}`; return scan; }
+      body = await res.json();
+    } catch (e) {
+      scan.error = `GovInfo search failed (${e instanceof Error ? e.message : String(e)})`;
+      return scan;
+    }
+    const results = body.results ?? [];
+    if (results.length === 0) break;
+    const todo: { pkg: string; gran: string; date: string }[] = [];
+    for (const r of results) {
+      const gran = granuleOf(r);
+      if (!r.packageId || !gran) { scan.error = 'GovInfo search returned a result with no section id; cannot read it'; return scan; }
+      if (seen.has(gran)) continue;
+      seen.add(gran);
+      todo.push({ pkg: r.packageId, gran, date: (r.dateIssued ?? r.packageId.slice(5)).slice(0, 10) });
+    }
+    // whole days only: group by date, and stop before a day that would exceed the budget
+    const days = [...new Set(todo.map((t) => t.date))];
+    for (const day of days) {
+      const group = todo.filter((t) => t.date === day);
+      if (scan.granules_read + group.length > budget && scan.granules_read > 0) { scan.truncated = true; return scan; }
+      await pool(group, 8, async (g) => {
+        scan.granules_read++;
+        try {
+          const r = await fetchWithTimeout(`${CONTENT_BASE}/${g.pkg}/html/${g.gran}.htm`, { headers: { 'User-Agent': UA$shared } }, 'GovInfo');
+          if (!r.ok) { scan.rejected.push({ n: null, why: `section ${g.gran} answered HTTP ${r.status}`, date: g.date }); return; }
+          const p = parseSenateCrec(await r.text());
+          for (const v of p.votes) scan.hits.push({ date: g.date, vote: v, granule: g.gran });
+          for (const [n, why] of p.rejected) scan.rejected.push({ n, why, date: g.date });
+        } catch (e) {
+          scan.rejected.push({ n: null, why: `section ${g.gran} could not be read (${e instanceof Error ? e.message : String(e)})`, date: g.date });
+        }
+      });
+      if (opts.enough?.(scan.hits)) return scan;
+    }
+    if (!body.offsetMark || results.length < 100) break;
+    mark = body.offsetMark;
+  }
+  return scan;
+}
 /**
  * Congress Member Votes -- how each U.S. House member voted, from the U.S.
  * House Clerk's roll-call votes, with attendance and party-line share.
@@ -951,10 +1289,16 @@ async function parseJsonBounded<T>(
  * from the Clerk live on each call (capped), so a stale table never silently
  * under-counts: the response names the last roll it covers.
  *
- * SENATE: not covered. senate.gov answered 403 to every request, root page
- * included, from both a laptop and the gateway on 2026-10-23, so no Senate
- * record could be read or verified. Asking for the Senate returns that as a
- * named reason rather than an empty result.
+ * SENATE: the Secretary of the Senate's own site answers 403 to every request
+ * (an Akamai WAF; root page included; fleet #3513), so it is not read. The
+ * Senate's roll calls are taken from the Congressional Record (U.S. Government
+ * Publishing Office), which prints each one with its Yeas / Nays / Present /
+ * Not Voting lists. Names there are surnames, resolved to bioguide ids against
+ * the congress-legislators roster at bake time; a roll is baked only when every
+ * name resolves to one distinct senator and the names equal the senators seated
+ * that day (scripts/bake-congress-member-votes.mjs). A roll that fails that is
+ * kept as a numbered placeholder (kind 's') with the reason, counted in
+ * excluded_rolls.not_derivable_rolls and never used in a figure.
  *
  * DERIVED FIGURES ALWAYS CARRY THEIR DENOMINATOR (see compute.ts): a
  * percentage with no stated base is never returned.
@@ -966,6 +1310,8 @@ import { POS_LABEL, figuresFor, type Work } from './compute.js';
 
 const UA = 'pipeworx-congress-member-votes/1.0 (+https://pipeworx.io)';
 const SOURCE = 'U.S. House Clerk, roll-call votes';
+const SENATE_SOURCE = 'U.S. Government Publishing Office, Congressional Record (Senate roll-call votes)';
+const sourceOf = (chamber: string) => (chamber === 'senate' ? SENATE_SOURCE : SOURCE);
 const TOPUP_CAP = 40;
 
 async function pwFetch(url: string): Promise<Response> {
@@ -989,13 +1335,13 @@ function bakedSessions(args: Record<string, unknown>): { sessions: CmvSession[];
 function toWork(s: CmvSession): Work {
   const members: Work['members'] = new Map();
   s.members.forEach(([id, last, party, state, role], i) => members.set(id, { id, last, party, state, speaker: role === 'speaker', pos: s.matrix[i] }));
-  return { congress: s.congress, session: s.session, year: s.year, rolls: s.rolls.slice(), members };
+  return { chamber: s.chamber === 'senate' ? 'senate' : 'house', congress: s.congress, session: s.session, year: s.year, rolls: s.rolls.slice(), members };
 }
 
 type TopUp = { attempted: boolean; rolls_added: number; through_roll: number; error?: string; capped?: boolean };
 
 /** Append rolls newer than the table, read live. Never throws: a failed top-up is reported in the payload. */
-async function topUp(w: Work): Promise<TopUp> {
+async function topUpHouse(w: Work): Promise<TopUp> {
   const t: TopUp = { attempted: true, rolls_added: 0, through_roll: w.rolls.length };
   try {
     let next = w.rolls.length + 1;
@@ -1040,6 +1386,77 @@ async function topUp(w: Work): Promise<TopUp> {
   return t;
 }
 
+const fold = (s: string) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z]/g, '');
+
+/**
+ * Senate top-up: rolls newer than the table, read from the Congressional
+ * Record through the same parser the bake uses. Stops (and says why) at the
+ * first roll it cannot vouch for rather than skipping over it, and refuses a
+ * roll whose names do not resolve to exactly the senators who voted on the
+ * previous baked roll, so a new senator never silently drops out of a figure.
+ */
+async function topUpSenate(w: Work, apiKey: string | undefined): Promise<TopUp> {
+  const t: TopUp = { attempted: true, rolls_added: 0, through_roll: w.rolls.length };
+  if (!apiKey) { t.error = 'live top-up needs the data.gov key the gateway supplies; none was available, so figures cover only the stored rolls (through roll ' + w.rolls.length + ')'; return t; }
+  const lastDate = [...w.rolls].reverse().find((r) => r.d)?.d;
+  if (!lastDate) { t.error = 'stored session has no dated roll to top up from'; return t; }
+  const today = new Date().toISOString().slice(0, 10);
+  if (lastDate >= today && w.rolls.length > 0) {
+    // same-day votes could still be added; fall through and let the search decide
+  }
+  const scan = await scanSenateRolls({ apiKey, from: lastDate, to: today, order: 'ASC', maxGranules: 60 });
+  if (scan.error) { t.error = `live top-up failed (${scan.error}); figures cover only the rolls up to roll ${w.rolls.length}`; return t; }
+  const byN = new Map<number, (typeof scan.hits)[number]>();
+  for (const h of scan.hits) if (h.vote.n > w.rolls.length) byN.set(h.vote.n, h);
+  const refused = new Map<number, string>();
+  for (const r of scan.rejected) if (r.n != null && r.n > w.rolls.length) refused.set(r.n, r.why);
+  const lastRecorded = [...w.rolls].reverse().find((r) => r.k === 'r');
+  const lastIdx = lastRecorded ? w.rolls.indexOf(lastRecorded) : -1;
+  const seatedBefore = lastIdx >= 0 ? [...w.members.values()].filter((m) => m.pos[lastIdx] !== '-').length : 0;
+  try {
+    for (let n = w.rolls.length + 1; n < w.rolls.length + 1 + TOPUP_CAP; n++) {
+      const h = byN.get(n);
+      const at = w.rolls.length;
+      if (!h) {
+        const why = refused.get(n);
+        if (!why) break; // not published (yet) or not found: the table simply ends here
+        w.rolls.push({ n, d: '', k: 's', t: '', l: '', q: '', r: '', x: `parse refused: ${why}` });
+        for (const m of w.members.values()) m.pos += '-';
+        t.rolls_added++;
+        continue;
+      }
+      const v = h.vote;
+      const resolved: { id: string; pos: string }[] = [];
+      for (const nm of v.names) {
+        const c = [...w.members.values()].filter((m) => fold(m.last) === fold(nm.last) && (!nm.st || m.state === nm.st));
+        if (c.length !== 1) throw new Error(`roll ${n}: "${nm.last}${nm.st ? ' (' + nm.st + ')' : ''}" matches ${c.length} senators in the stored roster (a new senator needs a re-bake)`);
+        resolved.push({ id: c[0].id, pos: nm.pos });
+      }
+      if (new Set(resolved.map((r) => r.id)).size !== resolved.length) throw new Error(`roll ${n}: the same senator is listed twice`);
+      if (seatedBefore && resolved.length !== seatedBefore) throw new Error(`roll ${n}: ${resolved.length} names but ${seatedBefore} senators voted on the last stored roll (membership changed; a re-bake is needed)`);
+      const desc = [v.heading, `Announced ${v.yeas}-${v.nays}`, v.vp_tiebreak ? 'Vice President cast the tie-breaking vote' : ''].filter(Boolean).join('; ');
+      w.rolls.push({ n, d: h.date, k: 'r', t: v.tag === 'Ex' ? 'Executive session' : v.tag === 'Leg' ? 'Legislative session' : v.tag, l: v.refs.join(', '), q: v.question, r: v.outcome, x: desc });
+      const pos = new Map(resolved.map((r) => [r.id, r.pos]));
+      for (const m of w.members.values()) m.pos += pos.get(m.id) ?? '-';
+      t.rolls_added++;
+      void at;
+    }
+    t.through_roll = w.rolls.length;
+    if (t.rolls_added >= TOPUP_CAP) t.capped = true;
+    if (scan.truncated) t.error = 'the live read stopped at its page budget; figures cover through roll ' + w.rolls.length + ' and later rolls may exist';
+  } catch (e) {
+    t.through_roll = w.rolls.length;
+    t.error = `live top-up stopped (${e instanceof Error ? e.message : String(e)}); figures cover only the rolls up to roll ${w.rolls.length}`;
+    // a half-applied roll must not survive: rebuild every member string to the same length
+    for (const m of w.members.values()) m.pos = m.pos.slice(0, w.rolls.length).padEnd(w.rolls.length, '-');
+  }
+  return t;
+}
+
+function topUp(w: Work, args: Record<string, unknown>): Promise<TopUp> {
+  return w.chamber === 'senate' ? topUpSenate(w, typeof args._apiKey === 'string' ? args._apiKey : undefined) : topUpHouse(w);
+}
+
 // ── shared request handling ──────────────────────────────────────────────
 
 function covered(sessions: CmvSession[]): string {
@@ -1051,18 +1468,15 @@ async function openSession(args: Record<string, unknown>): Promise<
   | { ok: false; out: Record<string, unknown> }
 > {
   const chamber = typeof args.chamber === 'string' ? args.chamber.trim().toLowerCase() : 'house';
-  if (chamber !== 'house') {
-    return {
-      ok: false,
-      out: {
-        found: false,
-        chamber,
-        error:
-          'Only House members are covered. Senate roll-call records could not be read: senate.gov refused every request (HTTP 403, including its home page) from this service and from a separate machine on 2026-10-23, so no Senate position, attendance or party-line figure is offered rather than a guessed one.',
-      },
-    };
+  if (chamber !== 'house' && chamber !== 'senate') {
+    return { ok: false, out: { found: false, chamber, error: `chamber must be "house" or "senate" (got ${JSON.stringify(args.chamber)}).` } };
   }
-  const { sessions, asOf } = bakedSessions(args);
+  const all = bakedSessions(args);
+  const asOf = all.asOf;
+  const sessions = all.sessions.filter((s) => (s.chamber === 'senate') === (chamber === 'senate'));
+  if (sessions.length === 0) {
+    return { ok: false, out: { found: false, chamber, source: sourceOf(chamber), error: `No ${chamber === 'senate' ? 'Senate' : 'House'} roll-call data is held.` } };
+  }
   const last = sessions[sessions.length - 1];
   const congress = typeof args.congress === 'number' ? Math.floor(args.congress) : last.congress;
   const sessionArg = typeof args.session === 'number' ? Math.floor(args.session) : undefined;
@@ -1077,19 +1491,19 @@ async function openSession(args: Record<string, unknown>): Promise<
   if (!s) {
     return {
       ok: false,
-      out: { found: false, source: SOURCE, error: `No House roll-call data is held for the ${congress}th Congress session ${session}. Covered: ${covered(sessions)}.`, covered: sessions.map((x) => ({ congress: x.congress, session: x.session })) },
+      out: { found: false, chamber, source: sourceOf(chamber), error: `No ${chamber === 'senate' ? 'Senate' : 'House'} roll-call data is held for the ${congress}th Congress session ${session}. Covered: ${covered(sessions)}.`, covered: sessions.map((x) => ({ congress: x.congress, session: x.session })) },
     };
   }
   const w = toWork(s);
-  const top = await topUp(w);
+  const top = await topUp(w, args);
   return { ok: true, w, top, asOfBaked: asOf, sessions };
 }
 
 function meta(w: Work, top: TopUp, bakedRolls: number) {
-  const dates = w.rolls.map((r) => r.d).sort();
+  const dates = w.rolls.map((r) => r.d).filter(Boolean).sort();
   return {
-    source: SOURCE,
-    chamber: 'house',
+    source: sourceOf(w.chamber),
+    chamber: w.chamber,
     congress: w.congress,
     session: w.session,
     data_as_of: dates[dates.length - 1],
@@ -1113,29 +1527,29 @@ function resolveMember(w: Work, args: Record<string, unknown>, sessions: CmvSess
     return {
       out: {
         found: false,
-        source: SOURCE,
+        source: sourceOf(w.chamber),
         bioguide_id: bio,
         error: elsewhere.length
           ? `${bio} appears on no roll call of the ${w.congress}th Congress session ${w.session}, but does in: ${elsewhere.join(', ')}.`
-          : `${bio} is not a House member on any roll call held (${covered(sessions)}). Senators are not covered, and an unknown or mistyped id also lands here.`,
+          : `${bio} is not a ${w.chamber === 'senate' ? 'Senate' : 'House'} member on any roll call held (${covered(sessions)}). A member of the other chamber, an unknown or a mistyped id also lands here.`,
       },
     };
   }
-  const hits = [...w.members.values()].filter((m) => m.last.toLowerCase() === name || m.last.toLowerCase().startsWith(name + ' (')).filter((m) => !state || m.state === state);
+  const hits = [...w.members.values()].filter((m) => m.last.toLowerCase() === name || m.last.toLowerCase().startsWith(name + ' (') || m.last.toLowerCase().startsWith(name + ' ')).filter((m) => !state || m.state === state);
   if (hits.length === 1) return { id: hits[0].id };
-  if (hits.length === 0) return { out: { found: false, source: SOURCE, error: `No House member with surname "${args.name}"${state ? ` in ${state}` : ''} in the ${w.congress}th Congress session ${w.session}. Use the surname as the Clerk prints it, or pass bioguide_id.` } };
-  return { out: { found: false, source: SOURCE, error: `"${args.name}" matches ${hits.length} members; pass bioguide_id or state.`, candidates: hits.slice(0, 12).map((m) => ({ bioguide_id: m.id, name: m.last, party: m.party, state: m.state })) } };
+  if (hits.length === 0) return { out: { found: false, source: sourceOf(w.chamber), error: `No ${w.chamber === 'senate' ? 'Senate' : 'House'} member with surname "${args.name}"${state ? ` in ${state}` : ''} in the ${w.congress}th Congress session ${w.session}. Use the surname as the ${w.chamber === 'senate' ? 'Congressional Record' : 'Clerk'} prints it, or pass bioguide_id.` } };
+  return { out: { found: false, source: sourceOf(w.chamber), error: `"${args.name}" matches ${hits.length} members; pass bioguide_id or state.`, candidates: hits.slice(0, 12).map((m) => ({ bioguide_id: m.id, name: m.last, party: m.party, state: m.state })) } };
 }
 
 function who(w: Work, id: string) {
   const m = w.members.get(id)!;
-  return { bioguide_id: m.id, name: m.last, party: m.party, state: m.state, note: 'name is the surname form the Clerk prints; party and state are as of the member\'s latest roll call' };
+  return { bioguide_id: m.id, name: m.last, party: m.party, state: m.state, note: `name is the surname form the ${w.chamber === 'senate' ? 'Congressional Record' : 'Clerk'} prints; party and state are as of the member's latest roll call` };
 }
 
 // ── tools ────────────────────────────────────────────────────────────────
 
 const SESSION_PROPS = {
-  chamber: { type: 'string', description: 'Only "house" is available (default). "senate" returns a named reason.' },
+  chamber: { type: 'string', description: '"house" (default) or "senate". The two chambers number their roll calls independently.' },
   congress: { type: 'number', description: 'Congress number, e.g. 119. Default: the newest held.' },
   session: { type: 'number', description: '1 or 2. Default: the newest held for the default Congress.' },
 };
@@ -1149,7 +1563,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'member_vote_positions',
     description:
-      'ANSWERS "how did Rep. X vote on bill Y" / "what were X\'s last 20 votes" / "did X vote against the budget resolution" -- one House member\'s recorded position (Yea, Nay, Present, Not Voting, or not on the roll) on roll calls, newest first, from the U.S. House Clerk\'s roll-call votes. Filter by `bill` (e.g. "H R 1"), `question_contains` (matched against question, bill number and description) or a roll range. Quorum calls and Speaker elections are left out unless include_non_recorded is true. Every response names its congress, session, the last roll it covers and data_as_of. House only: a Senate request, an unknown member, or a Congress/session not held each return a named reason, never an empty list.',
+      'ANSWERS "how did Rep. X vote on bill Y" / "what were X\'s last 20 votes" / "did X vote against the budget resolution" -- one member\'s recorded position (Yea, Nay, Present, Not Voting, or not on the roll) on roll calls, newest first -- House members from the U.S. House Clerk\'s roll-call votes, senators (chamber "senate") from the Congressional Record, where the Senate\'s roll calls are printed. Filter by `bill` (e.g. "H R 1"), `question_contains` (matched against question, bill number and description) or a roll range. Quorum calls, Speaker elections and Senate rolls whose record could not be derived are left out unless include_non_recorded is true. Every response names its chamber, congress, session, the last roll it covers and data_as_of. An unknown member or a Congress/session not held returns a named reason, never an empty list.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1167,7 +1581,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'member_attendance_party_line',
     description:
-      'ANSWERS "how many votes did Rep. X miss", "how often does X vote with their party", "party unity score" -- attendance and party-line share for ONE House member over a session (or a roll range), computed from the U.S. House Clerk\'s roll-call votes. Nothing is returned as a bare percentage: attendance gives its denominator (recorded roll calls the member was on the roll for; quorum calls and Speaker elections are excluded and counted; rolls before the member was seated or after they left are excluded and counted -- absence from the roll is NOT treated as Not Voting) and splits yea/nay, present and Not Voting. Party line gives two figures, each with its own denominator and exclusions: share of yea/nay votes cast with the member\'s party majority (a strict majority of that party\'s yea/nay voters; ties excluded and counted), and party unity (only the roll calls where a majority of Democrats opposed a majority of Republicans). If a figure cannot be computed from the rolls in range (member on none, no party-splitting votes, independent) it is null with a stated reason, never 0% or 100%. House only; the Senate returns a named reason.',
+      'ANSWERS "how many votes did Rep. X miss", "how often does X vote with their party", "party unity score" -- attendance and party-line share for ONE member (House, or a senator with chamber "senate") over a session (or a roll range), computed from the U.S. House Clerk\'s roll-call votes or, for the Senate, the Congressional Record\'s printed roll calls. Nothing is returned as a bare percentage: attendance gives its denominator (recorded roll calls the member was on the roll for; quorum calls, Speaker elections and Senate rolls that could not be derived are excluded and counted; rolls before the member was seated or after they left are excluded and counted -- absence from the roll is NOT treated as Not Voting) and splits yea/nay, present and Not Voting. Party line gives two figures, each with its own denominator and exclusions: share of yea/nay votes cast with the member\'s party majority (a strict majority of that party\'s yea/nay voters; ties excluded and counted), and party unity (only the roll calls where a majority of Democrats opposed a majority of Republicans). If a figure cannot be computed from the rolls in range (member on none, no party-splitting votes, independent) it is null with a stated reason, never 0% or 100%. Independents (including the Senate\'s two caucusing independents) have no D-versus-R majority to compare against, so their party-line figure is null with that reason.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1181,7 +1595,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'roll_call_positions',
     description:
-      'ANSWERS "who voted against roll call 100", "how did Texas Republicans split on roll 250", "how many Democrats voted Yea" -- every House member\'s position on ONE roll call from the U.S. House Clerk\'s roll-call votes, with Yea/Nay/Present/Not Voting tallies by party. Pass party (D/R/I), state or position (yea/nay/present/not_voting) to list matching members; with none of these only the tallies and the roll\'s question, result and bill are returned. A roll number that does not exist in that session returns a named reason.',
+      'ANSWERS "who voted against roll call 100", "how did Texas Republicans split on roll 250", "how many Democrats voted Yea" -- every member\'s position on ONE roll call (House: the U.S. House Clerk\'s roll-call votes; Senate: the Congressional Record) with Yea/Nay/Present/Not Voting tallies by party. Pass party (D/R/I), state or position (yea/nay/present/not_voting) to list matching members; with none of these only the tallies and the roll\'s question, result and bill are returned. A roll number that does not exist in that session returns a named reason.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1195,6 +1609,11 @@ const tools: McpToolExport['tools'] = [
     },
   },
 ];
+
+const RESULT_NOTE = 'The Record prints the tally but no outcome sentence this tool could match, so the result is not stated rather than inferred from the tally (cloture and treaty votes need more than a simple majority).';
+function kindLabel(k: string): string {
+  return k === 'q' ? 'quorum call' : k === 's' ? 'record not derivable (see description)' : 'election (positions are candidate names)';
+}
 
 const POS_BY_NAME: Record<string, string> = { yea: 'Y', aye: 'Y', nay: 'N', no: 'N', present: 'P', not_voting: 'X', 'not voting': 'X' };
 
@@ -1219,7 +1638,7 @@ async function memberVotePositions(args: Record<string, unknown>) {
     const roll = w.rolls[i];
     if (roll.n < from || roll.n > to) continue;
     if (!incl && roll.k !== 'r') continue;
-    if (bill && normBill(roll.l) !== bill) continue;
+    if (bill && !roll.l.split(', ').some((x) => normBill(x) === bill)) continue; // a Senate roll can name several measures
     if (q && !`${roll.q} ${roll.l} ${roll.x}`.toLowerCase().includes(q)) continue;
     matched.push(i);
   }
@@ -1237,12 +1656,13 @@ async function memberVotePositions(args: Record<string, unknown>) {
       roll_number: roll.n,
       date: roll.d,
       bill: roll.l || null,
-      question: roll.q,
+      question: roll.q || null,
       description: roll.x || null,
       vote_type: roll.t,
-      result: roll.r,
+      result: roll.r || null,
       position: label,
-      ...(roll.k !== 'r' ? { roll_kind: roll.k === 'q' ? 'quorum call' : 'election (positions are candidate names)' } : {}),
+      ...(roll.k !== 'r' ? { roll_kind: kindLabel(roll.k) } : {}),
+      ...(w.chamber === 'senate' && roll.k === 'r' && !roll.r ? { result_note: RESULT_NOTE } : {}),
     };
   });
   void POS_LABEL;
@@ -1281,6 +1701,7 @@ async function memberAttendancePartyLine(args: Record<string, unknown>) {
       with_party_majority: 'Of the member\'s Yea/Nay votes, the share matching the position taken by a strict majority of their own party\'s Yea/Nay voters on that roll. Includes lopsided and unanimous votes, so it runs high; rolls where the party was tied are excluded.',
       party_unity: 'Same, restricted to roll calls where a majority of Democrats voted against a majority of Republicans (Yea/Nay voters only).',
       party_basis: 'The member\'s party as of their latest roll call, applied to all rolls in range.',
+      ...(w.chamber === 'senate' ? { senate_independents: 'The two independents who caucus with the Democrats are not counted in the Democratic majority; they are listed as I and their own party-line figure is null with that reason.', senate_not_voting: 'The Senate prints a NOT VOTING list on every roll, so a senator absent from a vote is Not Voting (counted as missed). A senator not seated yet or already gone appears on no list and is excluded and counted as not on the roll.', senate_vice_president: 'A Vice President tie-breaking vote is not a senator\'s position and is not in any figure; it is named in the roll\'s description.' } : {}),
     },
     ...f,
   };
@@ -1297,6 +1718,9 @@ async function rollCallPositions(args: Record<string, unknown>) {
   }
   const i = n - 1;
   const roll = w.rolls[i];
+  if (roll.k === 's') {
+    return { found: false, ...meta(w, top, bakedRolls), roll: { roll_number: roll.n, kind: kindLabel(roll.k) }, error: `Roll ${n} exists in the ${w.congress}th Congress session ${w.session}, but its member positions could not be derived with confidence: ${roll.x}. No positions are offered rather than guessed ones.` };
+  }
   const party = typeof args.party === 'string' ? args.party.trim().toUpperCase().slice(0, 1) : '';
   const state = typeof args.state === 'string' ? args.state.trim().toUpperCase() : '';
   const posArg = typeof args.position === 'string' ? args.position.trim().toLowerCase() : '';
@@ -1322,7 +1746,7 @@ async function rollCallPositions(args: Record<string, unknown>) {
   return {
     found: true,
     ...meta(w, top, bakedRolls),
-    roll: { roll_number: roll.n, date: roll.d, bill: roll.l || null, question: roll.q, description: roll.x || null, vote_type: roll.t, result: roll.r, kind: roll.k === 'r' ? 'recorded vote' : roll.k === 'q' ? 'quorum call' : 'election (positions are candidate names)' },
+    roll: { roll_number: roll.n, date: roll.d, bill: roll.l || null, question: roll.q || null, description: roll.x || null, vote_type: roll.t, result: roll.r || null, ...(w.chamber === 'senate' && roll.k === 'r' && !roll.r ? { result_note: RESULT_NOTE } : {}), kind: roll.k === 'r' ? 'recorded vote' : kindLabel(roll.k) },
     members_on_roll: onRoll.length,
     tallies_by_party: byParty,
     ...(members ? { matching_members: members.length, members } : { hint: 'Pass party, state or position to list the matching members.' }),

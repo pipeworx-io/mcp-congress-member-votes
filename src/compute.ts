@@ -6,6 +6,7 @@
 import type { CmvRoll } from './cmv-index-data.js';
 
 export interface Work {
+  chamber: 'house' | 'senate';
   congress: number;
   session: number;
   year: number;
@@ -46,7 +47,7 @@ export function partyMajorities(w: Work, party: string, lo: number, hi: number):
 
 export interface MemberFigures {
   rolls_in_range: number;
-  excluded_rolls: { quorum_calls: number; election_rolls: number };
+  excluded_rolls: { quorum_calls: number; election_rolls: number; not_derivable_rolls: number };
   attendance: {
     denominator: number;
     voted_yea_or_nay: number;
@@ -81,16 +82,19 @@ export interface MemberFigures {
  * lo/hi are 0-based roll indexes (inclusive). Only kind 'r' rolls are used;
  * quorum calls and Speaker/election rolls are counted and named, never
  * silently dropped, and never counted as attendance or as a party position.
+ * Senate rolls whose record could not be derived (kind 's') are excluded the
+ * same way and counted in not_derivable_rolls.
  */
 export function figuresFor(w: Work, id: string, lo: number, hi: number): MemberFigures {
   const m = w.members.get(id)!;
-  const excluded = { quorum_calls: 0, election_rolls: 0 };
+  const excluded = { quorum_calls: 0, election_rolls: 0, not_derivable_rolls: 0 };
   const att = { voted: 0, present: 0, nv: 0, off: 0 };
   const rec: number[] = [];
   for (let i = lo; i <= hi; i++) {
     const k = w.rolls[i].k;
     if (k === 'q') excluded.quorum_calls++;
     else if (k === 'e') excluded.election_rolls++;
+    else if (k === 's') excluded.not_derivable_rolls++;
     else rec.push(i);
   }
   for (const i of rec) {

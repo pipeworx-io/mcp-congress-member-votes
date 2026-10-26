@@ -1,14 +1,14 @@
 # @pipeworx/congress-member-votes
 
-How each U.S. House member voted, how often they were there, and how often they vote with their party, from the U.S. House Clerk's roll-call votes.
+How each U.S. House member and senator voted, how often they were there, and how often they vote with their party — House from the U.S. House Clerk's roll-call votes, Senate from the Congressional Record (U.S. Government Publishing Office).
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1875+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1879+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
-- `member_vote_positions(bioguide_id | name [+ state], bill?, question_contains?, from_roll?, to_roll?, limit?, congress?, session?)` — one member's position (Yea, Nay, Present, Not Voting, or not on the roll) on roll calls, newest first. Answers "how did Rep. X vote on bill Y".
-- `member_attendance_party_line(bioguide_id | name [+ state], from_roll?, to_roll?, congress?, session?)` — attendance and party-line share for one member over a session or roll range. Every figure carries its denominator and exclusions; a figure that cannot be computed is `null` with a stated reason, never 0% or 100%.
-- `roll_call_positions(roll_number, party?, state?, position?, congress?, session?)` — every member's position on one roll call, with party tallies.
+- `member_vote_positions(chamber?, bioguide_id | name [+ state], bill?, question_contains?, from_roll?, to_roll?, limit?, congress?, session?)` — one member's position (Yea, Nay, Present, Not Voting, or not on the roll) on roll calls, newest first. Answers "how did Rep. X vote on bill Y".
+- `member_attendance_party_line(chamber?, bioguide_id | name [+ state], from_roll?, to_roll?, congress?, session?)` — attendance and party-line share for one member over a session or roll range. Every figure carries its denominator and exclusions; a figure that cannot be computed is `null` with a stated reason, never 0% or 100%.
+- `roll_call_positions(chamber?, roll_number, party?, state?, position?, congress?, session?)` — every member's position on one roll call, with party tallies.
 
 ## What the derived figures mean
 
@@ -21,17 +21,34 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
 
 ## Auth
 
-Keyless.
+Keyless for the House. The Senate's live top-up uses the api.data.gov key the gateway supplies; without it the Senate answers from the stored rolls and says so in `live_topup`.
 
 ## Coverage
 
-House only. 119th Congress, sessions 1 and 2. Other Congresses and the Senate return a named reason. Senate roll-call records could not be read: the Secretary of the Senate's site refused every request (HTTP 403) from this service and from a separate machine on 2026-10-23.
+119th Congress, sessions 1 and 2, both chambers (`chamber: "house"` is the default; `"senate"` for the Senate). Other Congresses return a named reason.
+
+**Senate.** The Secretary of the Senate's own site refuses automated requests (HTTP 403 from a web-application firewall, root page included, 2026-10-23), so the Senate's roll calls are taken from the Congressional Record, which prints each one with its Yeas / Nays / Present / Not Voting lists. Those lists carry surnames, not ids, so each name is resolved to a bioguide id against the congress-legislators roster. A Senate roll is kept only when
+
+- the Yeas and Nays lists match the counts the Record announces, in two places (the announcement and the list headings);
+- every name resolves to exactly one senator seated that day, and no senator is listed twice;
+- the number of names equals the number of senators seated that day.
+
+A roll that fails any of these is kept as a numbered placeholder (`record not derivable`, with the reason in its `description`), counted in `excluded_rolls.not_derivable_rolls`, and never used in a figure. The bake refuses to write a session whose roll numbers have an unexplained hole.
+
+What the Senate figures mean differently from the House:
+
+- The Senate prints a NOT VOTING list on every roll, so a senator absent from a vote is **Not Voting** and counts as missed; a senator not yet seated (or already gone) appears on no list and is excluded and counted as not on the roll.
+- A Vice President tie-breaking vote is not a senator's position and is in no figure; the roll's `description` names it.
+- The two independents who caucus with the Democrats are party `I`: they are not counted in the Democratic majority, and their own party-line figure is `null` with a stated reason.
+- `result` is the Record's own outcome sentence, or `null` with a note when the Record has none this tool can match; it is never inferred from the tally.
+- `date` is the Record's issue date, i.e. the Senate's legislative day: a day that runs past midnight is printed under the earlier date (the 1 July 2025 vote on H.R. 1 is under 30 June).
 
 ## Data sources
 
 - U.S. House Clerk, roll-call votes. US federal data, public domain.
+- U.S. Government Publishing Office, Congressional Record (Senate roll-call votes), with the roster from the congress-legislators project (public domain). US federal data, public domain.
 
-Rolls are held as a compact member-by-roll table, generated by `scripts/bake-congress-member-votes.mjs` (the refresh path), uploaded at deploy and injected into the pack (`pack-baked-indexes.json`). Rolls newer than the table are read from the Clerk live on each call (up to 40), so every response states the last roll it covers (`rolls_covered`), how many were added live (`live_topup`) and `data_as_of`. If the live read fails the response says so and covers only the stored rolls.
+Rolls are held as a compact member-by-roll table, generated by `scripts/bake-congress-member-votes.mjs` (the refresh path), uploaded at deploy and injected into the pack (`pack-baked-indexes.json`). Rolls newer than the table are read live on each call (up to 40; from the Clerk for the House, from the Congressional Record for the Senate), so every response states the last roll it covers (`rolls_covered`), how many were added live (`live_topup`) and `data_as_of`. If the live read fails the response says so and covers only the stored rolls.
 
 The Clerk answers a roll that does not exist with an HTTP 200 stub rather than a 404; the pack treats that as "no such roll" and any other non-record body as a fault.
 
@@ -79,7 +96,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1875+ data sources. The
+Both URLs reach the same gateway and the same 1879+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
