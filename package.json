@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-congress-member-votes",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Congress Member Votes -- how each U.S. House member voted, from the U.S. House Clerk's roll-call votes, with attendance and party-line share.",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "congress-member-votes",
     "gatewaySlug": "congress-member-votes",
-    "sourceHash": "v1-95e458f9ca24f8d305de1d45f1041b8122aaead29cb480f57bb0741051723e67",
-    "sourceCommit": "4277282d72f9bf55e548b3799aaf737baf22152f"
+    "sourceHash": "v1-2446e7faba1dd59ff14457173f071a9679d6cba374ecdf8862f55da7723f71bb",
+    "sourceCommit": "8cc978183948532674e797c429305c9d8ab2a1c3"
   }
 }
